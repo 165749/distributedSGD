@@ -1,5 +1,6 @@
 import os
 import argparse
+import torch
 import torch.distributed as dist
 
 from server import ParameterServer
@@ -50,7 +51,7 @@ if __name__ == "__main__":
     os.environ['NCCL_IB_DISABLE'] = '1'  # TODO: enable for infiniband
     if args.interface != "none":
         os.environ['GLOO_SOCKET_IFNAME'] = args.interface
-        os.environ['GLOO_SOCKET_IFNAME'] = args.interface
+        os.environ['NCCL_SOCKET_IFNAME'] = args.interface
         print('Set network interface {}'.format(args.interface))
 
     if args.model not in name_to_model.keys():
@@ -64,7 +65,7 @@ if __name__ == "__main__":
         if args.gpu_per_worker > 1:
             assert args.no_overlap is True
             assert args.all_reduce is False  # TODO: implementation
+            assert torch.cuda.device_count() >= args.gpu_per_worker
             worker.run_multi_gpu(args)
         else:
             worker.run(args)
-    dist.destroy_process_group()

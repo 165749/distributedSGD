@@ -196,7 +196,7 @@ def build_distributed_model(model, lr, tracer, cuda=False, ignore_bn=False, no_o
     return DistributedModel
 
 
-def build_multi_gpu_model(model, all_reduce_group, tracer, ignore_bn=False):
+def build_multi_gpu_model(model, gpu_id, gpu_per_worker, all_reduce_group, tracer, ignore_bn=False):
     class MultiGPUModel(model):
         def __init__(self, *args, **kwargs):
             super(MultiGPUModel, self).__init__(*args, **kwargs)
@@ -209,7 +209,13 @@ def build_multi_gpu_model(model, all_reduce_group, tracer, ignore_bn=False):
                                               if name.rsplit('.', maxsplit=1)[0] not in bn_names]
             else:
                 self.parameters_with_names = [(name, para) for name, para in self.named_parameters()]
+            self.gpu_id = gpu_id
+            self.gpu_per_worker = gpu_per_worker
+            self.gpu_device = torch.device('cuda', self.gpu_id)
             self.all_reduce_group = all_reduce_group
+            if self.gpu_id == 0:
+                # Only GPU 0 performs downlink and uplink
+                self.server_rank = dist.get_rank() + self.gpu_per_worker
             self.tracer = tracer
             self.parameters_buffer = []  # For receivers collecting model parameters
             self.senders = []
@@ -221,7 +227,7 @@ def build_multi_gpu_model(model, all_reduce_group, tracer, ignore_bn=False):
             self.register_hooks()
 
             for _, para in self.parameters_with_names:
-                self.parameters_buffer.append(torch.zeros(para.data.size()))
+                self.parameters_buffer.append(torch.zeros(para.data.size(), device=self.gpu_device))
             for name, module in self.named_modules():
                 module.name = name
 
@@ -244,12 +250,12 @@ def build_multi_gpu_model(model, all_reduce_group, tracer, ignore_bn=False):
         def finish_tracer_span(self):
             self.span.finish()
 
-        def send(self, tensor, layer, type, server_rank):
+        def send(self, tensor, layer, type, rank):
             with self.tracer.start_active_span('send') as span:
                 span.set_tag('size', tensor.nelement() * tensor.element_size())
                 span.set_tag('layer', layer)
                 span.set_tag('type', type)
-                sender = dist.isend(tensor, server_rank)
+                sender = dist.isend(tensor, rank)
                 self.senders.append(sender)
 
         def wait_all_senders(self):
@@ -257,11 +263,11 @@ def build_multi_gpu_model(model, all_reduce_group, tracer, ignore_bn=False):
                 sender.wait()
             self.senders = []
 
-        def reset_and_start_receivers(self, server_rank):
+        def reset_and_start_receivers(self, rank):
             self.receivers = []
             self.current_receiver = 0
             for para in self.parameters_buffer:
-                receiver = dist.irecv(para, server_rank)
+                receiver = dist.irecv(para, rank)
                 self.receivers.append(receiver)
 
         def wait_receiver(self):
@@ -287,82 +293,88 @@ def build_multi_gpu_model(model, all_reduce_group, tracer, ignore_bn=False):
             self.span.finish()
             self.span = self.tracer.start_span('compute')
 
-        def init(self, gpu_id, gpu_per_worker):
-            if gpu_id == 0:
-                # Send a empty gradients to fetch the initial model from the server
-                # Send gradients to the server layer by layer
-                with tracer.start_active_span('init'):
-                    # Wait for starting up
+        def init(self):
+            # Send a empty gradients to fetch the initial model from the server
+            # Send gradients to the server layer by layer
+            with tracer.start_active_span('init'):
+                if self.gpu_id == 0:
                     with tracer.start_active_span('wait'):
-                        dist.send(tensor=torch.zeros(1), dst=0)
-                        dist.recv(tensor=torch.zeros(1), src=0)
+                        # Wait for starting up
+                        dist.send(tensor=torch.zeros(1, device=self.gpu_device), dst=self.server_rank)
+                        dist.recv(tensor=torch.zeros(1, device=self.gpu_device), src=self.server_rank)
+
+                    layer_idx = len(self.parameters_with_names) - 1
                     for name, para in reversed(self.parameters_with_names):
                         with tracer.start_active_span('send') as span:
                             span.set_tag('size', para.data.nelement() * para.data.element_size())
                             name = name.rsplit('.', maxsplit=1)
                             span.set_tag('layer', name[0])
                             span.set_tag('type', name[1])
-                            dist.send(torch.zeros(para.data.size()), self.worker_id + gpu_per_worker)
+                            dist.send(self.parameters_buffer[layer_idx], self.server_rank)
+                            layer_idx -= 1
 
-            # Inform other gpus starting next step
-            dist.all_reduce(torch.ones(1).cuda(), op=dist.ReduceOp.SUM, group=self.all_reduce_group)
+        def step_begin(self, epoch, i):
+            if self.step_span is not None:
+                self.step_span.finish()
+            self.step_span = self.tracer.start_span('epoch {} step {}'.format(epoch, i))
 
-        def step_begin(self, epoch, i, gpu_id, gpu_per_worker):
-            if gpu_id == 0:
-                server_rank = dist.get_rank() + gpu_per_worker
-                # Inform the server starting next step (by setting tensor[0] to 0)
-                tensor = torch.zeros(1)
-                dist.send(tensor, server_rank)
+            with self.tracer.start_active_span('downlink'):
+                if self.gpu_id == 0:
+                    # Inform the server starting next step (by setting tensor[0] to 0)
+                    tensor = torch.zeros(1, device=self.gpu_device)
+                    dist.send(tensor, self.server_rank)
 
-                if self.step_span is not None:
-                    self.step_span.finish()
-                self.step_span = self.tracer.start_span('epoch {} step {}'.format(epoch, i))
+                    self.reset_and_start_receivers(self.server_rank)
+                    for _ in self.parameters_with_names:
+                        self.wait_receiver()
+                # Synchronize all GPUs
+                dist.all_reduce(torch.zeros(1, device=self.gpu_device), op=dist.ReduceOp.SUM, group=self.all_reduce_group)
 
-                self.reset_and_start_receivers(server_rank)
-                if self.no_overlap:
-                    with self.tracer.start_active_span('downlink'):
-                        for _ in self.parameters_with_names:
-                            self.wait_receiver()
-
-            # Inform other gpus starting next step
-            dist.all_reduce(torch.ones(1).cuda(), op=dist.ReduceOp.SUM, group=self.all_reduce_group)
-
-        def step_finish(self, lr, gpu_id, gpu_per_worker):
-            if gpu_id == 0:
-                server_rank = dist.get_rank() + gpu_per_worker
-                with self.tracer.start_active_span('uplink'):
+        def step_finish(self, lr):
+            with self.tracer.start_active_span('uplink'):
+                if self.gpu_id == 0:
                     for name, para in reversed(self.parameters_with_names):
                         with self.tracer.start_active_span('lr') as span:
                             name = name.rsplit('.', maxsplit=1)
                             span.set_tag('layer', name[0])
                             span.set_tag('type', name[1])
                             grad = lr * para.grad
-                            grad = grad.cpu()
-                            self.send(grad, name[0], name[1], server_rank)
+                            self.send(grad, name[0], name[1], self.server_rank)
                     self.wait_all_senders()
+                # Synchronize all GPUs
+                dist.all_reduce(torch.zeros(1, device=self.gpu_device), op=dist.ReduceOp.SUM, group=self.all_reduce_group)
+
+        def stop_training(self):
+            if gpu_id == 0:
+                # Inform the server about completion (by setting tensor[0] to inf)
+                tensor = torch.zeros(1)
+                tensor[0] = float('inf')
+                dist.send(tensor.to(self.gpu_device), self.server_rank)
+            # Synchronize all GPUs
+            dist.all_reduce(torch.zeros(1, device=self.gpu_device), op=dist.ReduceOp.SUM, group=self.all_reduce_group)
+            self.step_span.finish()
 
         def _allreduce_fut(
                 self, process_group: dist.ProcessGroup, tensor: torch.Tensor
-        ) -> torch.futures.Future:
+        ) -> torch.futures.Future[torch.Tensor]:
             span = self.tracer.start_span('allreduce')
             span.set_tag('size', tensor.nelement() * tensor.element_size())
             group_to_use = process_group if process_group is not None else dist.group.WORLD
-            world_size = (
-                process_group.size() if process_group is not None else dist.get_world_size()
+
+            # Apply the division first to avoid overflow, especially for FP16.
+            tensor.div_(group_to_use.size())
+
+            def complete(fut):
+                span.finish()
+                return fut.value()[0]
+
+            return (
+                dist.all_reduce(tensor, group=group_to_use, async_op=True).get_future().then(complete)
             )
 
-            "Averages the input gradient tensor by allreduce and returns a future."
-            fut = dist.all_reduce(tensor, group=group_to_use, async_op=True).get_future()
-
-            def div_by_group_size(fut):
-                ret = [fut.value()[0].div_(world_size)]
-                span.finish()
-                return ret
-
-            return fut.then(div_by_group_size)
-
-        def communication_fn(self, process_group: dist.ProcessGroup, bucket: dist._GradBucket) -> torch.futures.Future:
-            return self._allreduce_fut(process_group, bucket.get_tensors()[0])
+        def communication_fn(self, process_group: dist.ProcessGroup, bucket: dist.GradBucket
+                             ) -> torch.futures.Future[torch.Tensor]:
+            return self._allreduce_fut(process_group, bucket.buffer())
 
     return MultiGPUModel
 

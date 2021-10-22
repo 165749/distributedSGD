@@ -10,7 +10,7 @@ class ParameterServer:
         self.worker_num = args.worker_num
         self.gpu_per_worker = args.gpu_per_worker
         self.world_size = (1 + self.gpu_per_worker) * self.worker_num + 1  # size of communication group
-        print("Creating ParameterServer with {} worker...", self.worker_num)
+        print("Creating Parameter Server with {} worker...".format(self.worker_num))
 
         model = name_to_model[args.model](num_classes=10)
         # Store model in the shared memory
@@ -40,6 +40,7 @@ class ParameterServer:
             threads.append(thread)
 
         # Initialize communication group
+        print("Initializing server with rank {}".format(0))
         dist.init_process_group('nccl', rank=0, world_size=self.world_size)
         if self.all_reduce:
             # Create new group for all workers to perform all_reduce
@@ -49,21 +50,23 @@ class ParameterServer:
                 dist.new_group([(1 + self.gpu_per_worker) * worker_id + k + 1 for k in range(self.gpu_per_worker)])
         print("server 0 initialized")
 
-        # Wait for everyone to be ready
-        for idx in range(1, self.world_size):
-            dist.recv(tensor=torch.zeros(1), src=idx)
-        for idx in range(1, 2 * self.world_size):
-            dist.send(tensor=torch.zeros(1), dst=idx)  # Send to everyone
-
         for thread in threads:
             thread.join()
 
+        dist.destroy_process_group()
         print("server 0 finished")
 
     @classmethod
     def receive(cls, parameters_with_names, server_id, worker_num, gpu_per_worker, cuda, barrier, all_reduce):
+        if cuda:
+            device = torch.device('cuda:0')
+            torch.cuda.set_device(0)
+        else:
+            device = torch.device('cpu')
+
         torch.autograd.set_grad_enabled(False)
         # Set up communication group
+        print("Initializing server with rank {}".format(server_id))
         dist.init_process_group('nccl', rank=server_id, world_size=(1 + gpu_per_worker) * worker_num + 1)
         if all_reduce:
             # Create new group for all workers to perform all_reduce
@@ -71,7 +74,7 @@ class ParameterServer:
         if gpu_per_worker > 1:
             for worker_id in range(worker_num):
                 dist.new_group([(1 + gpu_per_worker) * worker_id + k + 1 for k in range(gpu_per_worker)])
-        print("server {} initialized".format(server_id))
+        print("server {} initialized".format(dist.get_rank()))
 
         # Start tracer for each server
         tracer = Tracer(cuda=cuda)
@@ -81,16 +84,18 @@ class ParameterServer:
 
         with tracer.start_active_span('server {}'.format(server_id)):
             span_step = tracer.start_span("init")
-            gradient_buffers = [torch.zeros(para.data.size()) for _, para in parameters_with_names]
+            gradient_buffers = [torch.zeros(para.data.size(), device=device) for _, para in parameters_with_names]
             step_num = 0
 
             # Wait for starting up
             with tracer.start_active_span('wait'):
-                dist.send(tensor=torch.zeros(1), dst=0)
-                dist.recv(tensor=torch.zeros(1), src=0)
+                dist.recv(tensor=torch.zeros(1, device=device), src=server_id - gpu_per_worker)
+                dist.send(tensor=torch.zeros(1, device=device), dst=server_id - gpu_per_worker)
+                barrier.wait()
+
             while True:
                 if all_reduce:
-                    tensor = torch.zeros(1)
+                    tensor = torch.zeros(1, device=device)
                     dist.recv(tensor=tensor, src=server_id - gpu_per_worker)
                     span_step.finish()
                     if tensor[0] == float('inf'):
@@ -109,26 +114,16 @@ class ParameterServer:
                             receiver.wait()
                             if barrier is None:  # For async
                                 with tracer.start_active_span('update'):
-                                    if cuda:
-                                        global_model[-1 - i].add_(gradient_buffers[-1 - i].cuda())
-                                        gradient_buffers[-1 - i].copy_(global_model[-1 - i])
-                                    else:
-                                        global_model[-1 - i].add_(gradient_buffers[-1 - i])
-                                        gradient_buffers[-1 - i].copy_(global_model[-1 - i])
+                                    global_model[-1 - i].add_(gradient_buffers[-1 - i])
+                                    gradient_buffers[-1 - i].copy_(global_model[-1 - i])
                     if barrier is not None:  # For sync
                         with tracer.start_active_span('update'):
                             for i, gradients in enumerate(gradient_buffers):
-                                if cuda:
-                                    global_model[i].add_(gradients.cuda())
-                                else:
-                                    global_model[i].add_(gradients)
+                                global_model[i].add_(gradients)
                         with tracer.start_active_span('collect'):
                             for i, gradients in enumerate(gradient_buffers):
-                                if cuda:
-                                    gradient_buffers[i] = global_model[i].cpu()
-                                else:
-                                    gradients.copy_(global_model[i])
-                    tensor = torch.zeros(1)
+                                gradients.copy_(global_model[i])
+                    tensor = torch.zeros(1, device=device)
                     dist.recv(tensor=tensor, src=server_id - gpu_per_worker)
                     if barrier is not None:
                         with tracer.start_active_span('barrier'):
