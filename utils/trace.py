@@ -57,6 +57,7 @@ class Tracer:
         if cuda:
             self.init_event = torch.cuda.Event(enable_timing=True)
             self.init_event.record()
+            torch.cuda.synchronize()
 
     def start_span(self, name):
         span_id = random.randrange(1, 18446744073709551616)  # random between (0, 16^16)
@@ -83,8 +84,8 @@ class Tracer:
                 json.dump([{
                     "id": "{:016x}".format(span.span_id),
                     "parent": "{:016x}".format(span.parent_id),
-                    "start": span.start_time.elapsed_time(self.init_event)//1000,
-                    "end": span.end_time.elapsed_time(self.init_event)//1000,
+                    "start": self.init_event.elapsed_time(span.start_time)*1000,
+                    "end": self.init_event.elapsed_time(span.end_time)*1000,
                     "op": span.name,
                     "tags": {k: v for k, v in map(lambda x: x.split("#"), span.tags)},
                 } for span in self.traces_collection], file)

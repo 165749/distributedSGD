@@ -205,10 +205,10 @@ def build_multi_gpu_model(model, gpu_id, gpu_per_worker, all_reduce_group, trace
                 for module in self.modules():
                     if isinstance(module, nn.BatchNorm2d):
                         module.skip_layer = True
-                self.parameters_with_names = [(name, para) for name, para in self.named_parameters()
+                self.parameters_with_names = [(name.replace('module.', ''), para) for name, para in self.named_parameters()
                                               if name.rsplit('.', maxsplit=1)[0] not in bn_names]
             else:
-                self.parameters_with_names = [(name, para) for name, para in self.named_parameters()]
+                self.parameters_with_names = [(name.replace('module.', ''), para) for name, para in self.named_parameters()]
             self.gpu_id = gpu_id
             self.gpu_per_worker = gpu_per_worker
             self.gpu_device = torch.device('cuda', self.gpu_id)
@@ -229,7 +229,7 @@ def build_multi_gpu_model(model, gpu_id, gpu_per_worker, all_reduce_group, trace
             for _, para in self.parameters_with_names:
                 self.parameters_buffer.append(torch.zeros(para.data.size(), device=self.gpu_device))
             for name, module in self.named_modules():
-                module.name = name
+                module.name = name.replace('module.', '')
 
         def register_hooks(self):
             print('Register hooks!')

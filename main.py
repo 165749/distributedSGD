@@ -1,7 +1,6 @@
 import os
 import argparse
 import torch
-import torch.distributed as dist
 
 from server import ParameterServer
 from worker import Worker
