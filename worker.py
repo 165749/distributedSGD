@@ -9,7 +9,8 @@ from sklearn.metrics import classification_report, accuracy_score
 
 from models.model import name_to_model
 from sgd import DownpourSGD
-from sgd import build_distributed_model, build_multi_gpu_model
+from sgd import build_distributed_model
+from multigpu_sgd import build_multi_gpu_model
 from utils.trace import Tracer
 
 
@@ -32,33 +33,19 @@ class Worker:
 
     @classmethod
     def train_multi_gpu(cls, gpu_id, args):
-        # Support since PyTorch 1.10
-        dist._DEFAULT_FIRST_BUCKET_BYTES = 1
         torch.cuda.set_device(gpu_id)
 
-        print("Initializing worker {} gpu {} with rank {}".
-              format(args.worker_id, gpu_id, (1 + args.gpu_per_worker) * args.worker_id + gpu_id + 1))
-        dist.init_process_group('nccl', rank=(1 + args.gpu_per_worker) * args.worker_id + gpu_id + 1,
-                                world_size=(1 + args.gpu_per_worker) * args.worker_num + 1)
-
         train_loader, _ = cls.prepare_data(args)
-
-        all_reduce_group = None
-        for worker_id in range(args.worker_num):
-            group = dist.new_group([(1 + args.gpu_per_worker) * worker_id + k + 1 for k in range(args.gpu_per_worker)])
-            if worker_id == args.worker_id:
-                all_reduce_group = group
-        print("Worker {} (id: {}, gpu: {}) initialized".format(dist.get_rank(), args.worker_id, gpu_id))
 
         tracer = Tracer(cuda=True)
 
         model = name_to_model[args.model](num_classes=10)
         model = model.to(gpu_id)
         model = build_multi_gpu_model(
-            torch.nn.parallel.DistributedDataParallel, gpu_id=gpu_id, gpu_per_worker=args.gpu_per_worker,
-                all_reduce_group=all_reduce_group, tracer=tracer, ignore_bn=args.ignore_bn
-        )(model, device_ids=[gpu_id], process_group=all_reduce_group, bucket_cap_mb=300)
-        model.register_comm_hook(all_reduce_group, model.communication_fn)  # Since PyTorch 1.8
+            torch.nn.parallel.DistributedDataParallel, worker_id=args.worker_id, worker_num=args.worker_num,
+            gpu_id=gpu_id, gpu_per_worker=args.gpu_per_worker, tracer=tracer, ignore_bn=args.ignore_bn
+        )(model, device_ids=[gpu_id], bucket_cap_mb=300)
+        model.register_comm_hook(None, model.communication_fn)  # Since PyTorch 1.8
 
         optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.0)
         # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=1, verbose=True, min_lr=1e-3)
@@ -79,7 +66,7 @@ class Worker:
                     start = time.time()
 
                 # Inform server starting next step (i.e., starting pushing the model to the worker)
-                model.step_begin(epoch, i)
+                model.step_begin(epoch * steps_per_epoch + i)
 
                 with tracer.start_active_span('prepare_data'):
                     inputs, labels = data
@@ -119,7 +106,7 @@ class Worker:
         model.stop_training()
         root_span.finish()
         torch.cuda.synchronize(device=gpu_id)
-        tracer.export_traces("worker{}.json".format(dist.get_rank()))
+        tracer.export_traces("worker{}_gpu{}.json".format(2 * args.worker_id + 1, gpu_id))
 
         dist.destroy_process_group()
         print('Finished Training')

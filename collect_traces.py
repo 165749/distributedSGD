@@ -23,16 +23,14 @@ if __name__ == '__main__':
                 with gzip.open(f"worker{worker_id}.json.gz") as f:
                     output_dict[f"worker{worker_id}"] = json.load(f)
         else:
-            world_size = (gpu_per_worker + 1) * worker_num + 1
             # Otherwise consider both workers and servers
-            server_ids = [k for k in range(0, world_size, gpu_per_worker + 1)]
-
-            for worker_id in range(1, world_size):
-                if worker_id not in server_ids:
-                    with gzip.open(f"worker{worker_id}.json.gz") as f:
-                        output_dict[f"worker{worker_id}"] = json.load(f)
-            for server_id in range(1, world_size):
-                if server_id in server_ids:
-                    with gzip.open(f"server{server_id}.json.gz") as f:
-                        output_dict[f"server{server_id}"] = json.load(f)
+            for worker_id in range(1, 2 * worker_num + 1, 2):
+                with gzip.open(f"worker{worker_id}.json.gz") as f:
+                    output_dict[f"worker{worker_id}"] = json.load(f)
+                for gpu_id in range(gpu_per_worker):
+                    with gzip.open(f"worker{worker_id}_gpu{gpu_id}.json.gz") as f:
+                        output_dict[f"worker{worker_id}_gpu{gpu_id}"] = json.load(f)
+            for server_id in range(2, 2 * worker_num + 1, 2):
+                with gzip.open(f"server{server_id}.json.gz") as f:
+                    output_dict[f"server{server_id}"] = json.load(f)
         json.dump(output_dict, output_file)
