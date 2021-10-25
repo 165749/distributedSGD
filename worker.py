@@ -43,7 +43,8 @@ class Worker:
         model = model.to(gpu_id)
         model = build_multi_gpu_model(
             torch.nn.parallel.DistributedDataParallel, worker_id=args.worker_id, worker_num=args.worker_num,
-            gpu_id=gpu_id, gpu_per_worker=args.gpu_per_worker, tracer=tracer, ignore_bn=args.ignore_bn
+            gpu_id=gpu_id, gpu_per_worker=args.gpu_per_worker, tracer=tracer, ignore_bn=args.ignore_bn,
+            allreduce=args.all_reduce
         )(model, device_ids=[gpu_id], bucket_cap_mb=300)
         model.register_comm_hook(None, model.communication_fn)  # Since PyTorch 1.8
 
@@ -106,7 +107,10 @@ class Worker:
         model.stop_training()
         root_span.finish()
         torch.cuda.synchronize(device=gpu_id)
-        tracer.export_traces("worker{}_gpu{}.json".format(2 * args.worker_id + 1, gpu_id))
+        if args.all_reduce:
+            tracer.export_traces("worker{}_gpu{}.json".format(args.worker_id, gpu_id))
+        else:
+            tracer.export_traces("worker{}_gpu{}.json".format(2 * args.worker_id + 1, gpu_id))
 
         dist.destroy_process_group()
         print('Finished Training')

@@ -61,9 +61,8 @@ if __name__ == "__main__":
         server.run()
     else:
         worker = Worker(args=args)
-        if args.gpu_per_worker > 1:
+        if args.gpu_per_worker >= 1:
             assert args.no_overlap is True
-            assert args.all_reduce is False  # TODO: implementation
             assert torch.cuda.device_count() >= args.gpu_per_worker
             worker.run_multi_gpu(args)
         else:

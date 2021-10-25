@@ -20,8 +20,9 @@ if __name__ == '__main__':
         if all_reduce:
             # For all_reduce case, only consider workers
             for worker_id in range(worker_num):
-                with gzip.open(f"worker{worker_id}.json.gz") as f:
-                    output_dict[f"worker{worker_id}"] = json.load(f)
+                for gpu_id in range(gpu_per_worker):
+                    with gzip.open(f"worker{worker_id}_gpu{gpu_id}.json.gz") as f:
+                        output_dict[f"worker{worker_id}_gpu{gpu_id}"] = json.load(f)
         else:
             # Otherwise consider both workers and servers
             for worker_id in range(1, 2 * worker_num + 1, 2):

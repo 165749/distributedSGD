@@ -5,18 +5,22 @@ import torch.distributed as dist
 from utils.trace import Tracer
 
 
-def build_multi_gpu_model(model, worker_id, worker_num, gpu_id, gpu_per_worker, tracer, ignore_bn=False):
+def build_multi_gpu_model(model, worker_id, worker_num, gpu_id, gpu_per_worker, tracer, ignore_bn=False, allreduce=False):
     class MultiGPUModel(model):
         def __init__(self, *args, **kwargs):
             # Support since PyTorch 1.10
             dist._DEFAULT_FIRST_BUCKET_BYTES = 1
 
-            master_addr = os.environ['MASTER_ADDR']
-            master_port = os.environ['MASTER_PORT']
-            os.environ['MASTER_ADDR'] = "localhost"
-            os.environ['MASTER_PORT'] = "2223"
-            dist.init_process_group('nccl', rank=gpu_id, world_size=gpu_per_worker)
-            print("Worker {} (id: {}, gpu: {}) initialized".format(dist.get_rank(), worker_id, gpu_id))
+            self.allreduce = allreduce
+            if self.allreduce:
+                dist.init_process_group('nccl', rank=worker_id * gpu_per_worker + gpu_id, world_size=worker_num * gpu_per_worker)
+            else:
+                master_addr = os.environ['MASTER_ADDR']
+                master_port = os.environ['MASTER_PORT']
+                os.environ['MASTER_ADDR'] = "localhost"
+                os.environ['MASTER_PORT'] = "2223"
+                dist.init_process_group('nccl', rank=gpu_id, world_size=gpu_per_worker)
+                print("Worker {} (id: {}, gpu: {}) initialized".format(dist.get_rank(), worker_id, gpu_id))
 
             super(MultiGPUModel, self).__init__(*args, **kwargs)
 
@@ -31,11 +35,7 @@ def build_multi_gpu_model(model, worker_id, worker_num, gpu_id, gpu_per_worker, 
                 self.parameters_with_names = [(name.replace('module.', ''), para) for name, para in self.named_parameters()]
             self.gpu_id = gpu_id
             self.gpu_per_worker = gpu_per_worker
-            if self.gpu_id == 0:
-                # Only GPU 0 performs downlink and uplink
-                self.server_rank = dist.get_rank() + self.gpu_per_worker
             self.tracer = tracer
-            self.parameters_buffer = []  # For receivers collecting model parameters
             self.step_span = None
             self.span = None
             self.hooks = []
@@ -43,6 +43,25 @@ def build_multi_gpu_model(model, worker_id, worker_num, gpu_id, gpu_per_worker, 
 
             for name, module in self.named_modules():
                 module.name = name.replace('module.', '')
+
+            if self.allreduce:
+                # For allreduce architecture
+                self.local_group = None
+                for i in range(worker_num):
+                    group = dist.new_group([i * gpu_per_worker + k for k in range(gpu_per_worker)])
+                    if i == worker_id:
+                        self.local_group = group
+                assert self.local_group is not None
+                cross_machine_group = dist.new_group([i * gpu_per_worker for i in range(worker_num)])
+                if self.gpu_id == 0:
+                    self.cross_machine_group = cross_machine_group
+                return
+
+            # For parameter server architecture
+            if self.gpu_id == 0:
+                # Only GPU 0 performs downlink and uplink
+                self.server_rank = dist.get_rank() + self.gpu_per_worker
+            self.parameters_buffer = []  # For receivers collecting model parameters
             for _, para in self.parameters_with_names:
                 self.parameters_buffer.append(torch.zeros(para.data.size()).share_memory_())
 
@@ -91,12 +110,23 @@ def build_multi_gpu_model(model, worker_id, worker_num, gpu_id, gpu_per_worker, 
             with tracer.start_active_span('init'):
                 if self.gpu_id == 0:
                     with tracer.start_active_span('wait'):
-                        self.q1.put('sync')
-                        self.q2.get()
-                        self.q1.put('send')
-                        self.q2.get()
+                        # Synchronize all machines
+                        if self.allreduce:
+                            dist.all_reduce(torch.zeros(1).cuda(), op=dist.ReduceOp.SUM, group=self.cross_machine_group)
+                        else:
+                            self.q1.put('sync')
+                            self.q2.get()
+                            self.q1.put('send')
+                            self.q2.get()
 
         def step_begin(self, step_idx):
+            if self.allreduce:
+                dist.all_reduce(torch.zeros(1).cuda(), op=dist.ReduceOp.SUM, group=self.local_group)
+                if self.step_span is not None:
+                    self.step_span.finish()
+                self.step_span = self.tracer.start_span('step {}'.format(step_idx))
+                return
+
             if self.gpu_id == 0:
                 self.q1.put('update')
                 self.q2.get()
@@ -124,6 +154,9 @@ def build_multi_gpu_model(model, worker_id, worker_num, gpu_id, gpu_per_worker, 
             dist.all_reduce(torch.zeros(1).cuda(), op=dist.ReduceOp.SUM)
 
         def step_finish(self, lr):
+            if self.allreduce:
+                return
+
             if self.gpu_id == 0:
                 with self.tracer.start_active_span('uplink_copy'):
                     layer_idx = len(self.parameters_buffer) - 1
@@ -141,6 +174,11 @@ def build_multi_gpu_model(model, worker_id, worker_num, gpu_id, gpu_per_worker, 
                     self.q2.get()
 
         def stop_training(self):
+            if self.allreduce:
+                dist.all_reduce(torch.zeros(1).cuda(), op=dist.ReduceOp.SUM, group=self.local_group)
+                self.step_span.finish()
+                return
+
             if gpu_id == 0:
                 self.q1.put('stop')
                 self.q2.get()
@@ -161,6 +199,9 @@ def build_multi_gpu_model(model, worker_id, worker_num, gpu_id, gpu_per_worker, 
 
             def complete(fut):
                 span.finish()
+                if self.allreduce and self.gpu_id == 0:
+                    with self.tracer.start_active_span('allreduce'):
+                        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=self.cross_machine_group)
                 return fut.value()[0]
 
             return (
