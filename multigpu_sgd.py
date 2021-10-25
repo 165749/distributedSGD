@@ -112,6 +112,7 @@ def build_multi_gpu_model(model, worker_id, worker_num, gpu_id, gpu_per_worker, 
                     self.q1.put('recv')
                     self.q2.get()
 
+                with self.tracer.start_active_span('downlink_copy'):
                     for layer_idx, buffer in enumerate(self.parameters_buffer):
                         with self.tracer.start_active_span('copy') as span:
                             name, para = self.parameters_with_names[layer_idx]
@@ -123,8 +124,8 @@ def build_multi_gpu_model(model, worker_id, worker_num, gpu_id, gpu_per_worker, 
             dist.all_reduce(torch.zeros(1).cuda(), op=dist.ReduceOp.SUM)
 
         def step_finish(self, lr):
-            with self.tracer.start_active_span('uplink'):
-                if self.gpu_id == 0:
+            if self.gpu_id == 0:
+                with self.tracer.start_active_span('uplink_copy'):
                     layer_idx = len(self.parameters_buffer) - 1
                     for buffer in reversed(self.parameters_buffer):
                         with self.tracer.start_active_span('lr') as span:
@@ -135,6 +136,7 @@ def build_multi_gpu_model(model, worker_id, worker_num, gpu_id, gpu_per_worker, 
                             buffer.copy_(lr * para.grad)
                             layer_idx -= 1
 
+                with self.tracer.start_active_span('uplink'):
                     self.q1.put('send')
                     self.q2.get()
 
