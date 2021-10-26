@@ -190,7 +190,7 @@ def build_multi_gpu_model(model, worker_id, worker_num, gpu_id, gpu_per_worker, 
         def _allreduce_fut(
                 self, process_group: dist.ProcessGroup, tensor: torch.Tensor
         ) -> torch.futures.Future[torch.Tensor]:
-            span = self.tracer.start_span('allreduce')
+            span = self.tracer.start_span('allreduce_local')
             span.set_tag('size', tensor.nelement() * tensor.element_size())
             group_to_use = process_group if process_group is not None else dist.group.WORLD
 
