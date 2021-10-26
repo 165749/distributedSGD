@@ -41,24 +41,6 @@ def build_distributed_model(model, lr, tracer, cuda=False, ignore_bn=False, no_o
             for name, module in self.named_modules():
                 module.name = name
 
-            # Send a empty gradients to fetch the initial model from the server
-            # Send gradients to the server layer by layer
-            with tracer.start_active_span('init'):
-                # Wait for starting up
-                with tracer.start_active_span('wait'):
-                    dist.send(tensor=torch.zeros(1), dst=0)
-                    dist.recv(tensor=torch.zeros(1), src=0)
-                # If performing all-reduce, do not need to send parameters to the server
-                if all_reduce:
-                    return
-                for name, para in reversed(self.parameters_with_names):
-                    with tracer.start_active_span('send') as span:
-                        span.set_tag('size', para.data.nelement() * para.data.element_size())
-                        name = name.rsplit('.', maxsplit=1)
-                        span.set_tag('layer', name[0])
-                        span.set_tag('type', name[1])
-                        dist.send(torch.zeros(para.data.size()), self.worker_id + 1)
-
         def register_hooks(self):
             print('Register hooks!')
             for layer in self.modules():
@@ -166,6 +148,26 @@ def build_distributed_model(model, lr, tracer, cuda=False, ignore_bn=False, no_o
                     grad = grad.cpu()
                     self.send(grad, module.name, 'weight')
             self.span = self.tracer.start_span('compute')
+
+        def init(self):
+            # Send a empty gradients to fetch the initial model from the server
+            # Send gradients to the server layer by layer
+            with tracer.start_active_span('init'):
+                # If performing all-reduce, do not need to send parameters to the server
+                if all_reduce:
+                    # TODO: Sync all workers
+                    return
+                # Wait for starting up
+                with tracer.start_active_span('wait'):
+                    dist.send(tensor=torch.zeros(1), dst=self.worker_id + 1)
+                    dist.recv(tensor=torch.zeros(1), src=self.worker_id + 1)
+                    for name, para in reversed(self.parameters_with_names):
+                        with tracer.start_active_span('send') as span:
+                            span.set_tag('size', para.data.nelement() * para.data.element_size())
+                            name = name.rsplit('.', maxsplit=1)
+                            span.set_tag('layer', name[0])
+                            span.set_tag('type', name[1])
+                            dist.send(torch.zeros(para.data.size()), self.worker_id + 1)
 
         def step_begin(self, epoch, i):
             # Inform the server starting next step (by setting tensor[0] to 0)

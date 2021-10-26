@@ -116,8 +116,7 @@ class Worker:
         print('Finished Training')
 
     def run(self, args):
-        dist.init_process_group('nccl', rank=(1 + args.gpu_per_worker) * args.worker_id + 1,
-                                world_size=(1 + args.gpu_per_worker) * args.worker_num + 1)
+        dist.init_process_group('gloo', rank=2 * args.worker_id + 1, world_size=2 * args.worker_num + 1)
         print("worker {} initialized".format(dist.get_rank()))
 
         tracer = Tracer(cuda=args.cuda)
@@ -134,6 +133,7 @@ class Worker:
         model.train()
         if args.cuda:
             model = model.cuda()
+        model.init()
 
         steps_per_epoch = len(self.train_loader)
         for epoch in range(args.epochs):  # loop over the dataset multiple times
