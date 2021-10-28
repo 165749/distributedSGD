@@ -9,7 +9,7 @@ from sklearn.metrics import classification_report, accuracy_score
 
 from models.model import name_to_model
 from sgd import DownpourSGD
-from sgd import build_distributed_model
+from sgd import build_distributed_model, build_allreduce_model
 from multigpu_sgd import build_multi_gpu_model
 from utils.trace import Tracer
 
@@ -45,7 +45,7 @@ class Worker:
             torch.nn.parallel.DistributedDataParallel, worker_id=args.worker_id, worker_num=args.worker_num,
             gpu_id=gpu_id, gpu_per_worker=args.gpu_per_worker, tracer=tracer, ignore_bn=args.ignore_bn,
             allreduce=args.all_reduce
-        )(model, device_ids=[gpu_id], bucket_cap_mb=300)
+        )(model, device_ids=[gpu_id], bucket_cap_mb=500)
         model.register_comm_hook(None, model.communication_fn)  # Since PyTorch 1.8
 
         optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.0)
@@ -116,15 +116,29 @@ class Worker:
         print('Finished Training')
 
     def run(self, args):
-        dist.init_process_group('gloo', rank=2 * args.worker_id + 1, world_size=2 * args.worker_num + 1)
-        print("worker {} initialized".format(dist.get_rank()))
+        if args.cuda and args.all_reduce:
+            dist.init_process_group('nccl', rank=args.worker_id, world_size=args.worker_num)
+            print("worker {} initialized".format(dist.get_rank()))
+            # Support since PyTorch 1.10
+            dist._DEFAULT_FIRST_BUCKET_BYTES = 1
 
-        tracer = Tracer(cuda=args.cuda)
-        model = build_distributed_model(name_to_model[args.model], lr=args.lr, tracer=tracer, cuda=args.cuda,
-                                        ignore_bn=args.ignore_bn, no_overlap=args.no_overlap,
-                                        all_reduce=args.all_reduce)(num_classes=10)
+            tracer = Tracer(cuda=args.cuda)
+            model = name_to_model[args.model](num_classes=10)
+            model = model.cuda()
+            model = build_allreduce_model(
+                torch.nn.parallel.DistributedDataParallel, tracer=tracer)(model, bucket_cap_mb=500)
+            model.register_comm_hook(None, model.communication_fn)
+            optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.0)
+        else:
+            dist.init_process_group('gloo', rank=2 * args.worker_id + 1, world_size=2 * args.worker_num + 1)
+            print("worker {} initialized".format(dist.get_rank()))
 
-        optimizer = DownpourSGD(model.parameters(), lr=args.lr, model=model)
+            tracer = Tracer(cuda=args.cuda)
+            model = build_distributed_model(name_to_model[args.model], lr=args.lr, tracer=tracer, cuda=args.cuda,
+                                            ignore_bn=args.ignore_bn, no_overlap=args.no_overlap,
+                                            all_reduce=args.all_reduce)(num_classes=10)
+
+            optimizer = DownpourSGD(model.parameters(), lr=args.lr, model=model)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=1, verbose=True, min_lr=1e-3)
 
         root_span = tracer.start_span('worker {}'.format(dist.get_rank()))
@@ -145,7 +159,7 @@ class Worker:
                     start = time.time()
 
                 # Inform server starting next step (i.e., starting pushing the model to the worker)
-                model.step_begin(epoch, i)
+                model.step_begin(epoch * steps_per_epoch + i)
 
                 with tracer.start_active_span('prepare_data'):
                     inputs, labels = data

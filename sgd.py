@@ -4,6 +4,91 @@ import torch.distributed as dist
 from torch.optim.optimizer import Optimizer
 
 
+def build_allreduce_model(model, tracer):
+    class AllReduceModel(model):
+        def __init__(self, *args, **kwargs):
+            super(AllReduceModel, self).__init__(*args, **kwargs)
+            self.worker_id = dist.get_rank()
+            self.tracer = tracer
+            self.step_span = None
+            self.span = None
+            self.hooks = []
+            self.register_hooks()
+            for name, module in self.named_modules():
+                module.name = name
+
+        def register_hooks(self):
+            print('Register hooks!')
+            for layer in self.modules():
+                hook = layer.register_forward_pre_hook(self.forward_pre_hook_fn)
+                self.hooks.append(hook)
+                hook = layer.register_backward_hook(self.backward_hook_fn)
+                self.hooks.append(hook)
+
+        def remove_hooks(self):
+            print('Remove hooks!')
+            for hook in self.hooks:
+                hook.remove()
+
+        def init_tracer_span(self):
+            self.span = self.tracer.start_span('compute')
+
+        def finish_tracer_span(self):
+            self.span.finish()
+
+        def forward_pre_hook_fn(self, module, input):
+            pass
+            self.span.finish()
+            self.span = self.tracer.start_span('compute')
+            self.span.set_tag('layer', module.name)
+
+        def backward_hook_fn(self, module, input, output):
+            pass
+            self.span.set_tag('layer', module.name)
+            self.span.finish()
+            self.span = self.tracer.start_span('compute')
+
+        def init(self):
+            pass
+
+        def step_begin(self, step_idx):
+            # Sync all workers
+            dist.all_reduce(torch.ones(1).cuda(), op=dist.ReduceOp.SUM)
+            if self.step_span is not None:
+                self.step_span.finish()
+            self.step_span = self.tracer.start_span('step {}'.format(step_idx))
+            return
+
+        def stop_training(self):
+            # Sync all workers
+            dist.all_reduce(torch.zeros(1).cuda(), op=dist.ReduceOp.SUM)
+            self.step_span.finish()
+
+        def _allreduce_fut(
+                self, process_group: dist.ProcessGroup, tensor: torch.Tensor
+        ) -> torch.futures.Future[torch.Tensor]:
+            span = self.tracer.start_span('allreduce')
+            span.set_tag('size', tensor.nelement() * tensor.element_size())
+            group_to_use = process_group if process_group is not None else dist.group.WORLD
+
+            # Apply the division first to avoid overflow, especially for FP16.
+            tensor.div_(group_to_use.size())
+
+            def complete(fut):
+                span.finish()
+                return fut.value()[0]
+
+            return (
+                dist.all_reduce(tensor, group=group_to_use, async_op=True).get_future().then(complete)
+            )
+
+        def communication_fn(self, process_group: dist.ProcessGroup, bucket: dist.GradBucket
+                             ) -> torch.futures.Future[torch.Tensor]:
+            return self._allreduce_fut(process_group, bucket.buffer())
+
+    return AllReduceModel
+
+
 def build_distributed_model(model, lr, tracer, cuda=False, ignore_bn=False, no_overlap=False, all_reduce=False):
     class DistributedModel(model):
         def __init__(self, *args, **kwargs):
@@ -169,14 +254,14 @@ def build_distributed_model(model, lr, tracer, cuda=False, ignore_bn=False, no_o
                             span.set_tag('type', name[1])
                             dist.send(torch.zeros(para.data.size()), self.worker_id + 1)
 
-        def step_begin(self, epoch, i):
+        def step_begin(self, step_idx):
             # Inform the server starting next step (by setting tensor[0] to 0)
             tensor = torch.zeros(1)
             dist.send(tensor, self.worker_id + 1)
 
             if self.step_span is not None:
                 self.step_span.finish()
-            self.step_span = self.tracer.start_span('epoch {} step {}'.format(epoch, i))
+            self.step_span = self.tracer.start_span('step {}'.format(step_idx))
 
             # If performing all-reduce, do not need to receive parameters from the server
             if self.all_reduce:
