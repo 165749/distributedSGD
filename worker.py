@@ -46,7 +46,10 @@ class Worker:
             gpu_id=gpu_id, gpu_per_worker=args.gpu_per_worker, tracer=tracer, ignore_bn=args.ignore_bn,
             allreduce=args.all_reduce
         )(model, device_ids=[gpu_id], bucket_cap_mb=500)
-        model.register_comm_hook(None, model.communication_fn)  # Since PyTorch 1.8
+        if args.all_reduce:
+            model.register_comm_hook(model.local_group, model.communication_fn)  # Since PyTorch 1.8
+        else:
+            model.register_comm_hook(None, model.communication_fn)  # Since PyTorch 1.8
 
         optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.0)
         # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=1, verbose=True, min_lr=1e-3)
